@@ -1,0 +1,22 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  @apply bg-surface text-slate-900 antialiased;
+}
+
+button,
+input,
+textarea {
+  @apply outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2;
+}
+
+::selection {
+  background-color: #c7d2fe;
+  color: #1e293b;
+}
