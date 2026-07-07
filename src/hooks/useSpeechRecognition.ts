@@ -273,6 +273,26 @@ export const useSpeechRecognition = (options: UseSpeechRecognitionOptions = {}) 
         const errorCode = event?.error || 'unknown';
         const errorMsg = `音声認識エラー: ${errorCode}`;
         console.error('[SpeechRecognition]', errorMsg, event);
+
+        // Safari (and some other browsers) expose webkitSpeechRecognition
+        // but then fail it with "not-allowed"/"service-not-allowed" even
+        // when microphone access itself is fine, or refuse to run it at
+        // all ("audio-capture", "network"). In those cases, fall back to
+        // recording locally and sending the audio to the backend instead
+        // of just giving up.
+        const shouldFallBackToServerRecording = [
+          'not-allowed',
+          'service-not-allowed',
+          'audio-capture',
+          'network',
+        ].includes(errorCode);
+
+        if (shouldFallBackToServerRecording) {
+          console.warn('[SpeechRecognition] Falling back to server-side recording after error:', errorCode);
+          void startServerRecording();
+          return;
+        }
+
         setErrorMessage(errorMsg);
         setStatus('error');
         options.onError?.(event);

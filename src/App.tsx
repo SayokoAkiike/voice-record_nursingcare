@@ -77,7 +77,11 @@ function App() {
       }
       if (interimText) setStatusMessage('音声認識中: ' + interimText);
     },
-    onError: () => setStatusMessage('音声認識にエラーが発生しました'),
+    onError: (event) => {
+      const detail = (event as { error?: string; message?: string } | undefined)?.message
+        || (event as { error?: string } | undefined)?.error;
+      setStatusMessage(detail ? `音声認識にエラーが発生しました: ${detail}` : '音声認識にエラーが発生しました');
+    },
   });
 
   const { matchedKeywords, lastDetectedKeyword } = useKeywordDetector(noteText, {
