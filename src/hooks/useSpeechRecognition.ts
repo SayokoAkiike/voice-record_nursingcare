@@ -64,28 +64,58 @@ export interface UseSpeechRecognitionOptions {
   onError?: (error: SpeechRecognitionErrorEvent) => void;
 }
 
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
+const API_KEY = import.meta.env.VITE_APP_API_KEY ?? '';
+const DEMO_MODE = import.meta.env.VITE_DEMO_MODE === 'true';
+
 const getSpeechRecognitionConstructor = (): SpeechRecognitionStatic | null => {
   const win = window as any;
   return win.SpeechRecognition || win.webkitSpeechRecognition || null;
 };
 
+const getBestAudioMimeType = (): string | undefined => {
+  const candidates = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/mpeg',
+  ];
+
+  if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) {
+    return undefined;
+  }
+
+  return candidates.find((mimeType) => MediaRecorder.isTypeSupported(mimeType));
+};
+
+const getFileExtension = (mimeType?: string): string => {
+  if (!mimeType) return 'webm';
+  if (mimeType.includes('mp4')) return 'm4a';
+  if (mimeType.includes('mpeg')) return 'mp3';
+  return 'webm';
+};
+
+const createErrorEvent = (error: string, message: string) => ({
+  error,
+  message,
+} as SpeechRecognitionErrorEvent);
+
 export const useSpeechRecognition = (options: UseSpeechRecognitionOptions = {}) => {
   const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const chunksRef = useRef<Blob[]>([]);
+  const finalTranscriptRef = useRef('');
+
   const [supported, setSupported] = useState(true);
   const [status, setStatus] = useState<SpeechRecognitionState['status']>('idle');
   const [interimTranscript, setInterimTranscript] = useState('');
   const [finalTranscript, setFinalTranscript] = useState('');
   const [errorMessage, setErrorMessage] = useState<string | undefined>(undefined);
 
-  const reset = useCallback(() => {
-    setInterimTranscript('');
-    setFinalTranscript('');
-    setErrorMessage(undefined);
-    setStatus('idle');
-  }, []);
-
   const updateTranscripts = useCallback(
     (finalText: string, interimText: string) => {
+      finalTranscriptRef.current = finalText;
       setFinalTranscript(finalText);
       setInterimTranscript(interimText);
       options.onResult?.(finalText, interimText);
@@ -93,19 +123,127 @@ export const useSpeechRecognition = (options: UseSpeechRecognitionOptions = {}) 
     [options]
   );
 
+  const cleanupMediaStream = useCallback(() => {
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+  }, []);
+
+  const transcribeAudio = useCallback(
+    async (audioBlob: Blob, mimeType?: string) => {
+      if (DEMO_MODE) {
+        throw new Error('音声文字起こしにはバックエンド接続が必要です。テキスト入力でデモを確認してください。');
+      }
+
+      const extension = getFileExtension(mimeType);
+      const formData = new FormData();
+      formData.append('file', audioBlob, `voice-note.${extension}`);
+
+      const res = await fetch(`${API_BASE}/api/transcribe`, {
+        method: 'POST',
+        headers: {
+          'X-App-API-Key': API_KEY,
+        },
+        body: formData,
+      });
+
+      if (!res.ok) {
+        throw new Error(`文字起こしAPIエラー: ${res.status}`);
+      }
+
+      const data = await res.json() as { text?: string };
+      return (data.text ?? '').trim();
+    },
+    []
+  );
+
+  const reset = useCallback(() => {
+    finalTranscriptRef.current = '';
+    setInterimTranscript('');
+    setFinalTranscript('');
+    setErrorMessage(undefined);
+    setStatus('idle');
+  }, []);
+
   const stop = useCallback(() => {
     if (recognitionRef.current) {
       recognitionRef.current.stop();
     }
+
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+
     setStatus('paused');
   }, []);
 
+  const startServerRecording = useCallback(async () => {
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      setSupported(false);
+      setErrorMessage('このブラウザでは音声録音に対応していません');
+      setStatus('error');
+      options.onError?.(createErrorEvent('unsupported', 'MediaRecorder is not available'));
+      return;
+    }
+
+    try {
+      chunksRef.current = [];
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+
+      const mimeType = getBestAudioMimeType();
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      mediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onerror = () => {
+        const message = '録音中にエラーが発生しました';
+        setErrorMessage(message);
+        setStatus('error');
+        cleanupMediaStream();
+        options.onError?.(createErrorEvent('recording-error', message));
+      };
+
+      recorder.onstop = async () => {
+        const audioBlob = new Blob(chunksRef.current, { type: mimeType || 'audio/webm' });
+        cleanupMediaStream();
+
+        try {
+          setInterimTranscript('文字起こし中...');
+          const text = await transcribeAudio(audioBlob, mimeType);
+          const nextFinal = `${finalTranscriptRef.current}${text}`.trimStart();
+          updateTranscripts(nextFinal, '');
+          setStatus('paused');
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          setErrorMessage(message);
+          setStatus('error');
+          options.onError?.(createErrorEvent('transcription-error', message));
+        }
+      };
+
+      recorder.start();
+      setStatus('listening');
+      setErrorMessage(undefined);
+      setInterimTranscript('録音中です。停止すると文字起こしします。');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setErrorMessage(`録音開始エラー: ${message}`);
+      setStatus('error');
+      cleanupMediaStream();
+      options.onError?.(createErrorEvent('permission-error', message));
+    }
+  }, [cleanupMediaStream, options, transcribeAudio, updateTranscripts]);
+
   const start = useCallback(() => {
     const SpeechRecognition = getSpeechRecognitionConstructor();
+
     if (!SpeechRecognition) {
-      setSupported(false);
-      setErrorMessage('このブラウザは音声認識に対応していません');
-      setStatus('error');
+      void startServerRecording();
       return;
     }
 
@@ -119,7 +257,7 @@ export const useSpeechRecognition = (options: UseSpeechRecognitionOptions = {}) 
 
       recognition.onresult = (event: SpeechRecognitionEvent) => {
         let interim = '';
-        let final = finalTranscript;
+        let final = finalTranscriptRef.current;
         for (let i = event.resultIndex; i < event.results.length; i += 1) {
           const transcript = event.results[i][0]?.transcript || ' ';
           if (event.results[i].isFinal) {
@@ -155,14 +293,16 @@ export const useSpeechRecognition = (options: UseSpeechRecognitionOptions = {}) 
       setErrorMessage(`初期化エラー: ${message}`);
       setStatus('error');
     }
-  }, [options, finalTranscript, updateTranscripts]);
+  }, [options, startServerRecording, updateTranscripts]);
 
   useEffect(() => {
     const SpeechRecognition = getSpeechRecognitionConstructor();
-    if (!SpeechRecognition) {
+    const hasServerRecordingFallback = Boolean(navigator.mediaDevices?.getUserMedia) && typeof MediaRecorder !== 'undefined';
+
+    if (!SpeechRecognition && !hasServerRecordingFallback) {
       setSupported(false);
       setStatus('error');
-      setErrorMessage('SpeechRecognition is not available');
+      setErrorMessage('SpeechRecognition and MediaRecorder are not available');
     }
 
     return () => {
@@ -173,8 +313,14 @@ export const useSpeechRecognition = (options: UseSpeechRecognitionOptions = {}) 
         recognitionRef.current.stop();
         recognitionRef.current = null;
       }
+
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+      }
+
+      cleanupMediaStream();
     };
-  }, []);
+  }, [cleanupMediaStream]);
 
   const workingStatus = useMemo(
     () => ({ supported, status, interimTranscript, finalTranscript, errorMessage }),
